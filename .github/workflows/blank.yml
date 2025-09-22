@@ -1,36 +1,143 @@
-# This is a basic workflow to help you get started with Actions
+parameters:
+  - name: integrationTestTool
+    default: 'null'
 
-name: CI
+  - name: module
+    default: ''
 
-# Controls when the workflow will run
-on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+  - name: testEnv
+    default: ''
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
+steps:
+  - ${{ if ne(parameters.integrationTestTool, 'null') }}:
+      - task: PowerShell@2
+        displayName: "Check Last Pipeline Run"
+        name: CheckLastBuild
+        inputs:
+          targetType: "inline"
+          script: |
+            $organization = "$(ado-org)"
+            $project = "$(ado-project)"
+            $pipelineId = "$(integration-pipeline-id)" 
+            $personalAccessToken = "$(svc-pat)"
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
-jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
+            echo "Pipeline ID : $pipelineId"
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
-    steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+            $headers = @{
+                Authorization = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$personalAccessToken"))
+                "Content-Type" = "application/json"
+            }
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
+            $currentTimeUTC = [System.DateTime]::UtcNow
+            $startTimeUTC = $currentTimeUTC.AddHours(-24)
 
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
-        run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+            Write-Host "🔹 Current UTC Time: $currentTimeUTC"
+            Write-Host "🔹 24 Hours Ago (UTC): $startTimeUTC"
+
+            $buildsUrl = "https://dev.azure.com/$organization/$project/_apis/build/builds?definitions=$pipelineId&statusFilter=completed&api-version=7.1-preview.7&queryOrder=finishTimeDescending"
+            try {
+                $response = Invoke-RestMethod -Uri $buildsUrl -Headers $headers -Method Get
+                if ($response -and $response.value -and $response.value.Count -gt 0) {
+                    $recentBuilds = $response.value | Where-Object {
+                        if ($_.finishTime) {
+                            $buildFinishTime = [System.DateTime]::Parse($_.finishTime).ToUniversalTime()
+                            Write-Host "🔹 Checking Build ID: $($_.id) - Finished: $buildFinishTime (UTC)"
+                            return $buildFinishTime -ge $startTimeUTC
+                        }
+                        return $false
+                    } | Sort-Object finishTime -Descending
+                } else {
+                    $recentBuilds = @()
+                }
+            } catch {
+                Write-Host " Error fetching builds: $_"
+                $recentBuilds = @()
+            }
+
+            if ($recentBuilds.Count -gt 0) {
+                $buildId = $recentBuilds[0].id
+                Write-Host " Pipeline $pipelineId ran in the last 24 hours. Build ID: $buildId"
+                echo "##vso[task.setvariable variable=BUILD_ID;isOutput=true]$buildId"
+                echo "##vso[task.setvariable variable=TRIGGER_PIPELINE]false"
+            } else {
+                Write-Host " Pipeline $pipelineId did NOT run in the last 24 hours."
+                echo "##vso[task.setvariable variable=TRIGGER_PIPELINE]true"
+            }
+
+
+      - task: DownloadPipelineArtifact@2
+        displayName: "Download All Artifacts"
+        inputs:
+          buildType: "specific"
+          project: "$(ado-project)"
+          definition: "$(integration-pipeline-id)" 
+          buildVersionToDownload: "latest"
+          allowPartiallySucceededBuilds: true
+          artifactName: "" 
+          targetPath: "$(Build.ArtifactStagingDirectory)"
+
+
+      - task: PowerShell@2
+        displayName: "List All cucumber.json Files"
+        inputs:
+          targetType: "inline"
+          script: |
+            Write-Host " Searching for *cucumber*.json files in $(Build.ArtifactStagingDirectory):"
+            $files = Get-ChildItem -Path "$(Build.ArtifactStagingDirectory)" -Recurse -Include *cucumber*.json -File
+            if ($files.Count -eq 0) {
+              Write-Host "No matching cucumber.json files found."
+            } else {
+              foreach ($file in $files) {
+                Write-Host " - $($file.FullName)"
+              }
+            }
+  
+      - ${{ if eq(parameters.integrationTestTool, 'cucumber') }}:
+          - task: PowerShell@2
+            displayName: "Evaluate Test Results"
+            inputs:
+              targetType: "inline"
+              script: |
+                $files = Get-ChildItem -Path "$(Build.ArtifactStagingDirectory)" -Recurse -Include *cucumber*.json -File
+                $overallFailed = $false
+  
+                foreach ($file in $files) {
+                    Write-Host "`n Evaluating: $($file.FullName)"
+                    try {
+                        $json = Get-Content -Raw -Path $file.FullName | ConvertFrom-Json
+                        $total = $json.Count
+                        $failed = ($json | Where-Object { $_.elements.status -eq "failed" }).Count
+                        $passed = $total - $failed
+                        $percentage = ($passed / $total) * 100
+                        Write-Host " - Total: $total | Passed: $passed | Failed: $failed | %: $percentage"
+  
+                        if ($percentage -lt 100) {
+                            $overallFailed = $true
+                        }
+                    } catch {
+                        Write-Host " Error reading: $($file.FullName)"
+                        $overallFailed = $true
+                    }
+                }
+  
+                if ($overallFailed) {
+                    Write-Host "One or more test reports failed to meet 100% pass criteria."
+                    exit 1
+                } else {
+                    Write-Host "All cucumber JSON test results passed 100%."
+                }
+
+
+
+
+
+
+  - ${{ if eq(parameters.integrationTestTool, 'null') }}:
+      - task: PowerShell@2
+        displayName: "Fail pipeline"
+        name: FailPipeline
+        inputs:
+          targetType: "inline"
+          script: |
+            echo "integration configurations are not set.."
+            exit 1
