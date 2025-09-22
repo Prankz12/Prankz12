@@ -1,143 +1,169 @@
-parameters:
-  - name: integrationTestTool
-    default: 'null'
+name: Check and Process Integration Test Artifacts
 
-  - name: module
-    default: ''
+on:
+  workflow_dispatch:
+    inputs:
+      integrationTestTool:
+        description: 'The integration test tool to use (e.g., cucumber)'
+        default: 'null'
+        required: false
+      module:
+        description: 'Module name'
+        default: ''
+        required: false
+      testEnv:
+        description: 'Test environment'
+        default: ''
+        required: false
 
-  - name: testEnv
-    default: ''
-
-steps:
-  - ${{ if ne(parameters.integrationTestTool, 'null') }}:
-      - task: PowerShell@2
-        displayName: "Check Last Pipeline Run"
-        name: CheckLastBuild
-        inputs:
-          targetType: "inline"
-          script: |
-            $organization = "$(ado-org)"
-            $project = "$(ado-project)"
-            $pipelineId = "$(integration-pipeline-id)" 
-            $personalAccessToken = "$(svc-pat)"
-
-            echo "Pipeline ID : $pipelineId"
-
-            $headers = @{
-                Authorization = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$personalAccessToken"))
-                "Content-Type" = "application/json"
-            }
-
-            $currentTimeUTC = [System.DateTime]::UtcNow
-            $startTimeUTC = $currentTimeUTC.AddHours(-24)
-
-            Write-Host "🔹 Current UTC Time: $currentTimeUTC"
-            Write-Host "🔹 24 Hours Ago (UTC): $startTimeUTC"
-
-            $buildsUrl = "https://dev.azure.com/$organization/$project/_apis/build/builds?definitions=$pipelineId&statusFilter=completed&api-version=7.1-preview.7&queryOrder=finishTimeDescending"
-            try {
-                $response = Invoke-RestMethod -Uri $buildsUrl -Headers $headers -Method Get
-                if ($response -and $response.value -and $response.value.Count -gt 0) {
-                    $recentBuilds = $response.value | Where-Object {
-                        if ($_.finishTime) {
-                            $buildFinishTime = [System.DateTime]::Parse($_.finishTime).ToUniversalTime()
-                            Write-Host "🔹 Checking Build ID: $($_.id) - Finished: $buildFinishTime (UTC)"
-                            return $buildFinishTime -ge $startTimeUTC
-                        }
-                        return $false
-                    } | Sort-Object finishTime -Descending
-                } else {
-                    $recentBuilds = @()
-                }
-            } catch {
-                Write-Host " Error fetching builds: $_"
-                $recentBuilds = @()
-            }
-
-            if ($recentBuilds.Count -gt 0) {
-                $buildId = $recentBuilds[0].id
-                Write-Host " Pipeline $pipelineId ran in the last 24 hours. Build ID: $buildId"
-                echo "##vso[task.setvariable variable=BUILD_ID;isOutput=true]$buildId"
-                echo "##vso[task.setvariable variable=TRIGGER_PIPELINE]false"
-            } else {
-                Write-Host " Pipeline $pipelineId did NOT run in the last 24 hours."
-                echo "##vso[task.setvariable variable=TRIGGER_PIPELINE]true"
-            }
-
-
-      - task: DownloadPipelineArtifact@2
-        displayName: "Download All Artifacts"
-        inputs:
-          buildType: "specific"
-          project: "$(ado-project)"
-          definition: "$(integration-pipeline-id)" 
-          buildVersionToDownload: "latest"
-          allowPartiallySucceededBuilds: true
-          artifactName: "" 
-          targetPath: "$(Build.ArtifactStagingDirectory)"
-
-
-      - task: PowerShell@2
-        displayName: "List All cucumber.json Files"
-        inputs:
-          targetType: "inline"
-          script: |
-            Write-Host " Searching for *cucumber*.json files in $(Build.ArtifactStagingDirectory):"
-            $files = Get-ChildItem -Path "$(Build.ArtifactStagingDirectory)" -Recurse -Include *cucumber*.json -File
-            if ($files.Count -eq 0) {
-              Write-Host "No matching cucumber.json files found."
-            } else {
-              foreach ($file in $files) {
-                Write-Host " - $($file.FullName)"
+jobs:
+  check-and-process-artifacts:
+    runs-on: ubuntu-latest
+    steps:
+      # Step 1: Check Last Workflow Run (equivalent to CheckLastBuild)
+      - name: Check Last Workflow Run
+        if: inputs.integrationTestTool != 'null'
+        run: |
+          $organization = "${{ secrets.ADO_ORG }}"
+          $project = "${{ secrets.ADO_PROJECT }}"
+          $pipelineId = "${{ secrets.INTEGRATION_PIPELINE_ID }}"
+          $personalAccessToken = "${{ secrets.ADO_PAT }}"
+          echo "Pipeline ID: $pipelineId"
+          
+          $headers = @{
+              Authorization = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$personalAccessToken"))
+              "Content-Type" = "application/json"
+          }
+          
+          $currentTimeUTC = [System.DateTime]::UtcNow
+          $startTimeUTC = $currentTimeUTC.AddHours(-24)
+          Write-Host "🔹 Current UTC Time: $currentTimeUTC"
+          Write-Host "🔹 24 Hours Ago (UTC): $startTimeUTC"
+          
+          $buildsUrl = "https://dev.azure.com/$organization/$project/_apis/build/builds?definitions=$pipelineId&statusFilter=completed&api-version=7.1-preview.7&queryOrder=finishTimeDescending"
+          
+          try {
+              $response = Invoke-RestMethod -Uri $buildsUrl -Headers $headers -Method Get
+              if ($response -and $response.value -and $response.value.Count -gt 0) {
+                  $recentBuilds = $response.value | Where-Object {
+                      if ($_.finishTime) {
+                          $buildFinishTime = [System.DateTime]::Parse($_.finishTime).ToUniversalTime()
+                          Write-Host "🔹 Checking Build ID: $($_.id) - Finished: $buildFinishTime (UTC)"
+                          return $buildFinishTime -ge $startTimeUTC
+                      }
+                      return $false
+                  } | Sort-Object finishTime -Descending
+              } else {
+                  $recentBuilds = @()
               }
+          } catch {
+              Write-Host "Error fetching builds: $_"
+              $recentBuilds = @()
+          }
+          
+          if ($recentBuilds.Count -gt 0) {
+              $buildId = $recentBuilds[0].id
+              Write-Host "Pipeline $pipelineId ran in the last 24 hours. Build ID: $buildId"
+              echo "BUILD_ID=$buildId" >> $GITHUB_ENV
+              echo "TRIGGER_PIPELINE=false" >> $GITHUB_ENV
+          } else {
+              Write-Host "Pipeline $pipelineId did NOT run in the last 24 hours."
+              echo "TRIGGER_PIPELINE=true" >> $GITHUB_ENV
+          }
+        shell: pwsh
+        env:
+          ADO_ORG: ${{ secrets.ADO_ORG }}
+          ADO_PROJECT: ${{ secrets.ADO_PROJECT }}
+          INTEGRATION_PIPELINE_ID: ${{ secrets.INTEGRATION_PIPELINE_ID }}
+          ADO_PAT: ${{ secrets.ADO_PAT }}
+
+      # Step 2: Download Artifacts from Azure DevOps
+      - name: Download All Artifacts
+        if: inputs.integrationTestTool != 'null'
+        run: |
+          $organization = "${{ secrets.ADO_ORG }}"
+          $project = "${{ secrets.ADO_PROJECT }}"
+          $pipelineId = "${{ secrets.INTEGRATION_PIPELINE_ID }}"
+          $personalAccessToken = "${{ secrets.ADO_PAT }}"
+          
+          $headers = @{
+              Authorization = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$personalAccessToken"))
+              "Content-Type" = "application/json"
+          }
+          
+          # Get the latest build
+          $buildsUrl = "https://dev.azure.com/$organization/$project/_apis/build/builds?definitions=$pipelineId&statusFilter=completed&api-version=7.1-preview.7&queryOrder=finishTimeDescending"
+          $response = Invoke-RestMethod -Uri $buildsUrl -Headers $headers -Method Get
+          
+          if ($response.value.Count -eq 0) {
+              Write-Host "No builds found for pipeline $pipelineId"
+              exit 1
+          }
+          
+          $buildId = $response.value[0].id
+          $artifactsUrl = "https://dev.azure.com/$organization/$project/_apis/build/builds/$buildId/artifacts?api-version=7.1-preview.5"
+          $artifacts = Invoke-RestMethod -Uri $artifactsUrl -Headers $headers -Method Get
+          
+          foreach ($artifact in $artifacts.value) {
+              $downloadUrl = $artifact.resource.downloadUrl
+              $artifactName = $artifact.name
+              Write-Host "Downloading artifact: $artifactName"
+              Invoke-WebRequest -Uri $downloadUrl -Headers $headers -OutFile "$artifactName.zip"
+              # Unzip the artifact
+              Expand-Archive -Path "$artifactName.zip" -DestinationPath "${{ github.workspace }}/artifacts/$artifactName" -Force
+          }
+        shell: pwsh
+        env:
+          ADO_ORG: ${{ secrets.ADO_ORG }}
+          ADO_PROJECT: ${{ secrets.ADO_PROJECT }}
+          INTEGRATION_PIPELINE_ID: ${{ secrets.INTEGRATION_PIPELINE_ID }}
+          ADO_PAT: ${{ secrets.ADO_PAT }}
+
+      # Step 3: List All cucumber.json Files
+      - name: List All cucumber.json Files
+        if: inputs.integrationTestTool != 'null'
+        run: |
+          Write-Host "Searching for *cucumber*.json files in ${{ github.workspace }}/artifacts:"
+          $files = Get-ChildItem -Path "${{ github.workspace }}/artifacts" -Recurse -Include *cucumber*.json -File
+          if ($files.Count -eq 0) {
+            Write-Host "No matching cucumber.json files found."
+          } else {
+            foreach ($file in $files) {
+              Write-Host " - $($file.FullName)"
             }
-  
-      - ${{ if eq(parameters.integrationTestTool, 'cucumber') }}:
-          - task: PowerShell@2
-            displayName: "Evaluate Test Results"
-            inputs:
-              targetType: "inline"
-              script: |
-                $files = Get-ChildItem -Path "$(Build.ArtifactStagingDirectory)" -Recurse -Include *cucumber*.json -File
-                $overallFailed = $false
-  
-                foreach ($file in $files) {
-                    Write-Host "`n Evaluating: $($file.FullName)"
-                    try {
-                        $json = Get-Content -Raw -Path $file.FullName | ConvertFrom-Json
-                        $total = $json.Count
-                        $failed = ($json | Where-Object { $_.elements.status -eq "failed" }).Count
-                        $passed = $total - $failed
-                        $percentage = ($passed / $total) * 100
-                        Write-Host " - Total: $total | Passed: $passed | Failed: $failed | %: $percentage"
-  
-                        if ($percentage -lt 100) {
-                            $overallFailed = $true
-                        }
-                    } catch {
-                        Write-Host " Error reading: $($file.FullName)"
-                        $overallFailed = $true
-                    }
-                }
-  
-                if ($overallFailed) {
-                    Write-Host "One or more test reports failed to meet 100% pass criteria."
-                    exit 1
-                } else {
-                    Write-Host "All cucumber JSON test results passed 100%."
-                }
+          }
+        shell: pwsh
 
-
-
-
-
-
-  - ${{ if eq(parameters.integrationTestTool, 'null') }}:
-      - task: PowerShell@2
-        displayName: "Fail pipeline"
-        name: FailPipeline
-        inputs:
-          targetType: "inline"
-          script: |
-            echo "integration configurations are not set.."
-            exit 1
+      # Step 4: Evaluate Test Results (Cucumber)
+      - name: Evaluate Test Results
+        if: inputs.integrationTestTool == 'cucumber'
+        run: |
+          $files = Get-ChildItem -Path "${{ github.workspace }}/artifacts" -Recurse -Include *cucumber*.json -File
+          $overallFailed = $false
+          
+          foreach ($file in $files) {
+              Write-Host "`nEvaluating: $($file.FullName)"
+              try {
+                  $json = Get-Content -Raw -Path $file.FullName | ConvertFrom-Json
+                  $total = $json.Count
+                  $failed = ($json | Where-Object { $_.elements.status -eq "failed" }).Count
+                  $passed = $total - $failed
+                  $percentage = ($passed / $total) * 100
+                  Write-Host " - Total: $total | Passed: $passed | Failed: $failed | %: $percentage"
+                  
+                  if ($percentage -lt 100) {
+                      $overallFailed = $true
+                  }
+              } catch {
+                  Write-Host "Error reading: $($file.FullName)"
+                  $overallFailed = $true
+              }
+          }
+          
+          if ($overallFailed) {
+              Write-Host "One or more test reports failed to meet 100% pass criteria."
+              exit 1
+          } else {
+              Write-Host "All cucumber JSON test results passed 100%."
+          }
+        shell: pwsh
